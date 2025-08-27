@@ -1,0 +1,22 @@
+# Core
+streamlit
+torch
+transformers
+sentence-transformers
+huggingface_hub
+
+# LangChain ecosystem
+langchain
+langchain-community
+langchain-text-splitters
+langchain-huggingface
+
+# Pinecone
+pinecone
+pinecone-text
+pinecone-notebooks
+
+# OCR + PDF handling
+pytesseract
+pdf2image
+nltk
