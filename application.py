@@ -708,15 +708,12 @@ def initialize_services():
 
 services = initialize_services()
 
-# -----------------------------
-# Utilities: OCR & chunking with metadata
-# -----------------------------
 def clean_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 def extract_text_pages(pdf_path: str, pdf_name: str) -> list:
     """
-    OCR the PDF and return a list of dicts:
+    OCR the PDF and return a list of dicts with metadata:
     [{"page": 1, "text": "....", "pdf_name": "file.pdf"}, ...]
     """
     pages = []
@@ -725,16 +722,20 @@ def extract_text_pages(pdf_path: str, pdf_name: str) -> list:
         for i, img in enumerate(images, start=1):
             txt = clean_text(pytesseract.image_to_string(img))
             if txt:
-                pages.append({"page": i, "text": txt, "pdf_name": pdf_name})
+                pages.append({
+                    "page": i,
+                    "text": txt,
+                    "pdf_name": pdf_name  # make sure pdf_name is passed here
+                })
         return pages
     except Exception as e:
-        st.error(f"OCR extraction error: {e}")
+        print(f"OCR extraction error: {e}")
         return []
 
-def chunk_page_text(page_dict, chunk_size=800):
+def chunk_page_text(page_dict, chunk_size=300):
     """
-    Create chunks from a page while preserving metadata for citation.
-    Returns texts[], metadatas[] aligned lists.
+    Split a page into chunks while keeping metadata for citation.
+    Returns: texts[], metadatas[] aligned lists.
     """
     txt = page_dict["text"]
     chunks = [txt[i:i+chunk_size] for i in range(0, len(txt), chunk_size) if txt[i:i+chunk_size].strip()]
@@ -743,8 +744,8 @@ def chunk_page_text(page_dict, chunk_size=800):
     for j, ch in enumerate(chunks):
         texts.append(ch)
         metas.append({
-            "pdf_name": page_dict.get("pdf_name"),
-            "page": page_dict.get("page"),
+            "pdf_name": page_dict.get("pdf_name", "Unknown PDF"),
+            "page": page_dict.get("page", "?"),
             "chunk_id": j
         })
     return texts, metas
@@ -1216,6 +1217,7 @@ with tab_chat:
         """, unsafe_allow_html=True)
 
         # File uploader with enhanced feedback and spacing
+       # File uploader with enhanced feedback and spacing
         uploaded_file = st.file_uploader(
             "Choose a PDF file", 
             type=['pdf'], 
@@ -1248,7 +1250,7 @@ with tab_chat:
                         else:
                             all_texts, all_metas = [], []
                             for p in pages:
-                                texts, metas = chunk_page_text(p, chunk_size=300)
+                                texts, metas = chunk_page_text(p, chunk_size=800)
                                 all_texts.extend(texts)
                                 all_metas.extend(metas)
 
@@ -1292,6 +1294,9 @@ with tab_chat:
                     f'<div class="status-message info-message">"{uploaded_file.name}" is already processed and ready to use!</div>',
                     unsafe_allow_html=True
                 )
+
+     
+
 
         # Add divider with spacing
         st.markdown("<br>", unsafe_allow_html=True)
