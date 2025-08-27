@@ -774,12 +774,26 @@ def build_rag_prompt(query, message_history, docs):
             role = "User" if msg["role"] == "user" else "Assistant"
             history_text += f"{role}: {msg['content']}\n"
 
-    # Format context blocks with explicit citation markers
+    # Guardrail: only answer medical queries
+    medical_keywords = ["medicine", "drug", "tablet", "capsule", "dose", "treatment",
+                        "symptom", "disease", "side effect", "condition", "mg", "ml",
+                        "infection", "therapy", "doctor", "consult", "fever", "pain"]
+    if not any(kw.lower() in query.lower() for kw in medical_keywords):
+        return f"""
+You are a medical assistant.  
+The user has asked: "{query}"  
+
+This is not related to medicine, health, or drugs.  
+Politely respond:  
+"I'm a medical chatbot, here to help with medical or drug-related queries. Please ask me something in that domain."
+"""
+
+    # Format context blocks with citations
     if docs:
         ctx_blocks = []
         for i, d in enumerate(docs, start=1):
             meta = getattr(d, "metadata", {}) or {}
-            pdf = meta.get("pdf_name")
+            pdf = meta.get("pdf_name", "Uploaded PDF")
             page = meta.get("page", "?")
             ctx_blocks.append(f"[C{i}] {pdf} (p.{page})\n{d.page_content}")
         context_blocks = "\n\n".join(ctx_blocks)
@@ -787,17 +801,18 @@ def build_rag_prompt(query, message_history, docs):
         context_blocks = "NO_RELEVANT_DOCUMENTS_FOUND"
 
     prompt = f"""
-You are a knowledgeable medical assistant tasked with answering user queries clearly and accurately. You provide preventions and diet plans when requested.
+You are a knowledgeable medical assistant tasked with answering user queries clearly and accurately.
 
 ### Chat History:
 {history_text}
 
 ### Knowledge Base Context:
-{context_blocks if context_blocks else "No relevant documents were found."}
+{context_blocks}
 
-Now, based on the above context and chat history, answer the following question:
+### Question:
+{query}
 
-Question: {query}
+
 
 Guidelines:
 - If the user greets you, greet them back politely. do not add any citations for greeting. dont add any sources to the response too.
@@ -884,8 +899,7 @@ Paracetamol may be considered as directed. Always consult a doctor before use.
 Disclaimer
 This information is for educational purposes only and not medical advice. Always consult a healthcare professional.
 
-Citations
-- Source: WHO Guidelines, p. 24
+
 
 
 ### Chat history:
