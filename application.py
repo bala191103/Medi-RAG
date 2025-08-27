@@ -687,11 +687,17 @@ def initialize_services():
         else:
             bm25_encoder = BM25Encoder()
 
-        retriever = PineconeHybridSearchRetriever(
+        retriever = PineconeHybridSearchRetriever (
             embeddings=embeddings,
             sparse_encoder=bm25_encoder,
-            index=index
+            index=index,
+            top_k=4,
+            alpha=0.5,  # balance dense vs sparse
+            
         )
+            
+            
+        
 
         return {"llm": llm_client, "retriever": retriever, "embeddings": embeddings,
                 "bm25_encoder": bm25_encoder, "index": index, "bm25_path": bm25_path,
@@ -828,7 +834,7 @@ Always keep your tone helpful, clear, and user-friendly.
 - Precautions / Safety Notes – contraindications, warnings, interactions (keep brief).
 - What to Do Next – simple actionable advice (e.g., consult doctor, when to seek care).
 - Disclaimer – always include a safety disclaimer.
-- Citations – structured reference to source(s).
+
 
 2. Tone & Language
 - Clear, concise, non-technical (layman-friendly).
@@ -848,10 +854,6 @@ Always keep your tone helpful, clear, and user-friendly.
 - Specify adult vs pediatric doses separately.
 - State routes (PO, IV, IM, etc.) clearly.
 
-5. Citation Guidelines
-
-- Always include at least one citation (real or placeholder).
-- Citation should the pdf name
 
 6. Response Length
 
@@ -913,18 +915,30 @@ def llm_chat(client, model, prompt, temperature=0.0, max_tokens=1200):
 # -----------------------------
 # Deterministic sources output (from retrieved docs metadata)
 # -----------------------------
-def format_sources_from_docs(docs):
+def format_sources_for_inline(docs, top_k=2):
+    """
+    Returns a dictionary mapping citation labels to metadata text.
+    Keeps only top_k most relevant docs per query.
+    Example: {"C1": "PDF_name, p.3"}
+    """
     seen = set()
-    items = []
-    for d in docs:
+    citation_map = {}
+    
+    # Only keep the first top_k docs (most relevant ones)
+    filtered_docs = docs[:top_k]
+
+    for i, d in enumerate(filtered_docs, start=1):
         meta = getattr(d, "metadata", {}) or {}
-        pdf = meta.get("pdf_name")
+        pdf = meta.get("pdf_name", "Unknown PDF")
         page = meta.get("page", "?")
         key = (pdf, page)
         if key not in seen:
             seen.add(key)
-            items.append(f"{pdf}, p. {page}")
-    return items
+            citation_map[f"C{i}"] = f"{pdf}, p.{page}"
+    
+    return citation_map
+
+
 
 # -----------------------------
 # LLM-as-Judge (optional, kept from your pipeline)
@@ -1131,7 +1145,7 @@ with tab_chat:
                             raise RuntimeError(services.get("error", "Service unavailable"))
 
                         # Retrieve contexts (documents with metadata)
-                        contexts = get_contexts(user_input.strip(), services["retriever"], top_n=4)
+                        contexts = get_contexts(user_input.strip(), services["retriever"], top_n=2)
 
                         # Build prompt that forces PDF-only answers
                         rag_prompt = build_rag_prompt(user_input.strip(), st.session_state.messages, contexts)
@@ -1146,14 +1160,16 @@ with tab_chat:
                             final_answer = "I couldn't find this information in the uploaded documents. Please upload relevant medical PDFs to get accurate answers."
                             used_contexts = []
                         else:
-                            # Build deterministic sources list from retrieved contexts
-                            sources = format_sources_from_docs(contexts)
+                            citation_map = format_sources_for_inline(contexts)
                             if "I couldn't find" in answer or "couldn't find" in answer.lower():
                                 final_answer = "I couldn't find this information in the uploaded documents. Please upload relevant medical PDFs."
                                 used_contexts = []
                             else:
-                                final_answer = answer
+                                # Append citation legend at the end
+                                citation_legend = "\n\nCitations:\n" + "\n".join([f"[{k}] {v}" for k, v in citation_map.items()]) if citation_map else ""
+                                final_answer = answer.strip() + citation_legend
                                 used_contexts = contexts
+
 
                         # Append assistant message
                         st.session_state.messages.append({"role": "assistant", "content": final_answer})
@@ -1232,7 +1248,7 @@ with tab_chat:
                         else:
                             all_texts, all_metas = [], []
                             for p in pages:
-                                texts, metas = chunk_page_text(p, chunk_size=800)
+                                texts, metas = chunk_page_text(p, chunk_size=300)
                                 all_texts.extend(texts)
                                 all_metas.extend(metas)
 
