@@ -687,17 +687,11 @@ def initialize_services():
         else:
             bm25_encoder = BM25Encoder()
 
-        retriever = PineconeHybridSearchRetriever (
+        retriever = PineconeHybridSearchRetriever(
             embeddings=embeddings,
             sparse_encoder=bm25_encoder,
-            index=index,
-            top_k=4,
-            alpha=0.5,  # balance dense vs sparse
-            
+            index=index
         )
-            
-            
-        
 
         return {"llm": llm_client, "retriever": retriever, "embeddings": embeddings,
                 "bm25_encoder": bm25_encoder, "index": index, "bm25_path": bm25_path,
@@ -708,12 +702,15 @@ def initialize_services():
 
 services = initialize_services()
 
+# -----------------------------
+# Utilities: OCR & chunking with metadata
+# -----------------------------
 def clean_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 def extract_text_pages(pdf_path: str, pdf_name: str) -> list:
     """
-    OCR the PDF and return a list of dicts with metadata:
+    OCR the PDF and return a list of dicts:
     [{"page": 1, "text": "....", "pdf_name": "file.pdf"}, ...]
     """
     pages = []
@@ -722,20 +719,16 @@ def extract_text_pages(pdf_path: str, pdf_name: str) -> list:
         for i, img in enumerate(images, start=1):
             txt = clean_text(pytesseract.image_to_string(img))
             if txt:
-                pages.append({
-                    "page": i,
-                    "text": txt,
-                    "pdf_name": pdf_name  # make sure pdf_name is passed here
-                })
+                pages.append({"page": i, "text": txt, "pdf_name": pdf_name})
         return pages
     except Exception as e:
-        print(f"OCR extraction error: {e}")
+        st.error(f"OCR extraction error: {e}")
         return []
 
-def chunk_page_text(page_dict, chunk_size=300):
+def chunk_page_text(page_dict, chunk_size=800):
     """
-    Split a page into chunks while keeping metadata for citation.
-    Returns: texts[], metadatas[] aligned lists.
+    Create chunks from a page while preserving metadata for citation.
+    Returns texts[], metadatas[] aligned lists.
     """
     txt = page_dict["text"]
     chunks = [txt[i:i+chunk_size] for i in range(0, len(txt), chunk_size) if txt[i:i+chunk_size].strip()]
@@ -744,8 +737,8 @@ def chunk_page_text(page_dict, chunk_size=300):
     for j, ch in enumerate(chunks):
         texts.append(ch)
         metas.append({
-            "pdf_name": page_dict.get("pdf_name", "Unknown PDF"),
-            "page": page_dict.get("page", "?"),
+            "pdf_name": page_dict.get("pdf_name"),
+            "page": page_dict.get("page"),
             "chunk_id": j
         })
     return texts, metas
@@ -774,26 +767,12 @@ def build_rag_prompt(query, message_history, docs):
             role = "User" if msg["role"] == "user" else "Assistant"
             history_text += f"{role}: {msg['content']}\n"
 
-    # Guardrail: only answer medical queries
-    medical_keywords = ["medicine", "drug", "tablet", "capsule", "dose", "treatment",
-                        "symptom", "disease", "side effect", "condition", "mg", "ml",
-                        "infection", "therapy", "doctor", "consult", "fever", "pain"]
-    if not any(kw.lower() in query.lower() for kw in medical_keywords):
-        return f"""
-You are a medical assistant.  
-The user has asked: "{query}"  
-
-This is not related to medicine, health, or drugs.  
-Politely respond:  
-"I'm a medical chatbot, here to help with medical or drug-related queries. Please ask me something in that domain."
-"""
-
-    # Format context blocks with citations
+    # Format context blocks with explicit citation markers
     if docs:
         ctx_blocks = []
         for i, d in enumerate(docs, start=1):
             meta = getattr(d, "metadata", {}) or {}
-            pdf = meta.get("pdf_name", "Uploaded PDF")
+            pdf = meta.get("pdf_name")
             page = meta.get("page", "?")
             ctx_blocks.append(f"[C{i}] {pdf} (p.{page})\n{d.page_content}")
         context_blocks = "\n\n".join(ctx_blocks)
@@ -801,9 +780,112 @@ Politely respond:
         context_blocks = "NO_RELEVANT_DOCUMENTS_FOUND"
 
     prompt = f"""
-You are a knowledgeable medical assistant tasked with answering user queries clearly and accurately.
+You are a knowledgeable medical assistant tasked with answering user queries clearly and accurately. You provide preventions and diet plans when requested.
 
 ### Chat History:
+{history_text}
+
+### Knowledge Base Context:
+{context_blocks if context_blocks else "No relevant documents were found."}
+
+Now, based on the above context and chat history, answer the following question:
+
+Question: {query}
+
+Guidelines:
+- If the user greets you, greet them back politely. do not add any citations for greeting. dont add any sources to the response too.
+- Always base your answers strictly on the provided context. Do not use any external knowledge or make assumptions.
+- Do not greet for every question asked. Greet only if the user greets you first.
+- Never fabricate or guess answers. If the information is not in the context, say you don't know.
+- Never start a response with "As an AI language model".
+- Never provide medical advice beyond general information. Always recommend consulting a healthcare professional for specific concerns.
+- If the user asks for a summary of the documents, provide a brief overview without citations.
+- If the context contains "NO_RELEVANT_DOCUMENTS_FOUND", respond with: "I couldn't find this information in the uploaded documents."
+- If the answer is not contained within the provided context, respond with: "I'm sorry, I don't have that information in the uploaded documents."
+- EXAMPLE FORMAT FOR GREETING:
+User: Hello
+Assistant: Hello! How can I assist you today?
+
+You are a polite and professional medical chatbot.  
+
+- Your role is to answer medical or drug-related queries and respond to simple greetings.  
+- If the user asks questions that are not related to medicine, health, or drugs (e.g., math problems, random trivia, coding), do not attempt to answer.  
+- Instead, reply politely with something like:  
+  "I'm a medical chatbot, here to help with medical or drug-related queries. Please ask me something in that domain."  
+
+Always keep your tone helpful, clear, and user-friendly.
+
+1. Standard Structure
+- Every drug/condition response should follow the same clear sections:
+- Drug Summary / Overview – short description (name, class, purpose).
+- Usage / Indications – what it's used for.
+- Dosage & Administration
+- Adult dose
+- Pediatric dose
+- Route (PO/IV/other)
+- Frequency
+- Maximum dose (if applicable)
+- Precautions / Safety Notes – contraindications, warnings, interactions (keep brief).
+- What to Do Next – simple actionable advice (e.g., consult doctor, when to seek care).
+- Disclaimer – always include a safety disclaimer.
+- Citations – structured reference to source(s).
+
+2. Tone & Language
+- Clear, concise, non-technical (layman-friendly).
+- Avoid jargon unless needed; explain medical terms briefly.
+- Neutral and professional — never give direct prescriptions, only general information.
+
+3. Safety First
+
+- Never give exact personalized medical advice (like "you should take X now").
+- Always include disclaimer: "This information is for educational purposes only and not a substitute for professional medical advice."
+- Encourage users to consult a healthcare professional.
+
+4. Consistency Rules
+
+- Always use SI units (mg, g, mL).
+- Show frequency as q4–6h, q12h etc.
+- Specify adult vs pediatric doses separately.
+- State routes (PO, IV, IM, etc.) clearly.
+
+5. Citation Guidelines
+
+- Always include at least one citation (real or placeholder).
+- Citation should the pdf name
+
+6. Response Length
+
+- Keep Summary short (2–3 lines).
+- Use bullet points for clarity.
+- Avoid long paragraphs unless needed for explanation.
+
+EXAMPLE RESPONSE FORMAT:
+Summary
+Paracetamol (Acetaminophen) is an analgesic and antipyretic used to reduce fever and mild to moderate pain.
+
+Usage / Indications
+- Fever
+- Mild to moderate pain
+
+Dosage & Administration
+- Adult: 500–1000 mg PO/IV q4–6h (max 4 g/day)
+- Pediatric: 10–15 mg/kg PO/IV q4–6h (max per guideline)
+
+Precautions / Safety
+- Avoid in severe liver disease
+- Use with caution with alcohol or hepatotoxic drugs
+
+What To Do Next
+Paracetamol may be considered as directed. Always consult a doctor before use.
+
+Disclaimer
+This information is for educational purposes only and not medical advice. Always consult a healthcare professional.
+
+Citations
+- Source: WHO Guidelines, p. 24
+
+
+### Chat history:
 {history_text}
 
 ### Knowledge Base Context:
@@ -812,24 +894,7 @@ You are a knowledgeable medical assistant tasked with answering user queries cle
 ### Question:
 {query}
 
-
-Guidelines:
-- Always base answers ONLY on the provided context. 
-- If context = "NO_RELEVANT_DOCUMENTS_FOUND", reply:
-  "I'm sorry, I don't have that information in the uploaded documents."
-
-- Do not use outside knowledge or assumptions.
-- Never fabricate answers.
-- If the query is not medical-related, politely decline as explained.
-- Provide responses in this structured format:
-  Summary
-  Usage / Indications
-  Dosage & Administration
-  Precautions / Safety Notes
-  What To Do Next
-  Disclaimer
-- Always include a disclaimer: 
-  "This information is for educational purposes only and not a substitute for professional medical advice."
+Answer only using the context above.
 """
     return prompt.strip()
 
@@ -848,30 +913,18 @@ def llm_chat(client, model, prompt, temperature=0.0, max_tokens=1200):
 # -----------------------------
 # Deterministic sources output (from retrieved docs metadata)
 # -----------------------------
-def format_sources_for_inline(docs, top_k=2):
-    """
-    Returns a dictionary mapping citation labels to metadata text.
-    Keeps only top_k most relevant docs per query.
-    Example: {"C1": "PDF_name, p.3"}
-    """
+def format_sources_from_docs(docs):
     seen = set()
-    citation_map = {}
-    
-    # Only keep the first top_k docs (most relevant ones)
-    filtered_docs = docs[:top_k]
-
-    for i, d in enumerate(filtered_docs, start=1):
+    items = []
+    for d in docs:
         meta = getattr(d, "metadata", {}) or {}
-        pdf = meta.get("pdf_name", "Unknown PDF")
+        pdf = meta.get("pdf_name")
         page = meta.get("page", "?")
         key = (pdf, page)
         if key not in seen:
             seen.add(key)
-            citation_map[f"C{i}"] = f"{pdf}, p.{page}"
-    
-    return citation_map
-
-
+            items.append(f"{pdf}, p. {page}")
+    return items
 
 # -----------------------------
 # LLM-as-Judge (optional, kept from your pipeline)
@@ -959,33 +1012,6 @@ st.markdown("<br>", unsafe_allow_html=True)
 # Tabs: Chat + Metrics with enhanced styling
 # -----------------------------
 tab_chat, tab_metrics = st.tabs(["Chat", "Metrics Dashboard"])
-
-def clean_response(text):
-    """
-    Removes citations like [C1], [C2], and any trailing pdf/page refs.
-    Example: 'Humira is used for arthritis [C1] pdf, p.10'
-    becomes: 'Humira is used for arthritis'
-    """
-    return re.sub(r"\[C\d+\].*?(?=\n|$)", "", text).strip()
-
-def filter_response(query: str, answer: str) -> str:
-    """
-    Removes citations for non-medical queries.
-    Keeps them intact for medical queries.
-    """
-    medical_keywords = [
-        "medicine", "drug", "tablet", "capsule", "dose", "treatment",
-        "symptom", "disease", "side effect", "condition", "mg", "ml",
-        "infection", "therapy", "doctor", "consult", "fever", "pain"
-    ]
-    
-    if not any(kw.lower() in query.lower() for kw in medical_keywords):
-        # Strip citations completely
-        answer = re.sub(r"Citations:.*", "", answer, flags=re.DOTALL).strip()
-        answer = re.sub(r"\[C\d+\]", "", answer).strip()
-    return answer
-
-
 
 # -----------------------------
 # ENHANCED CHAT TAB
@@ -1105,7 +1131,7 @@ with tab_chat:
                             raise RuntimeError(services.get("error", "Service unavailable"))
 
                         # Retrieve contexts (documents with metadata)
-                        contexts = get_contexts(user_input.strip(), services["retriever"], top_n=2)
+                        contexts = get_contexts(user_input.strip(), services["retriever"], top_n=4)
 
                         # Build prompt that forces PDF-only answers
                         rag_prompt = build_rag_prompt(user_input.strip(), st.session_state.messages, contexts)
@@ -1120,28 +1146,18 @@ with tab_chat:
                             final_answer = "I couldn't find this information in the uploaded documents. Please upload relevant medical PDFs to get accurate answers."
                             used_contexts = []
                         else:
-                            citation_map = format_sources_for_inline(contexts)
+                            # Build deterministic sources list from retrieved contexts
+                            sources = format_sources_from_docs(contexts)
                             if "I couldn't find" in answer or "couldn't find" in answer.lower():
                                 final_answer = "I couldn't find this information in the uploaded documents. Please upload relevant medical PDFs."
                                 used_contexts = []
                             else:
-                                # Append citation legend at the end
-                                citation_legend = "\n\nCitations:\n" + "\n".join([f"[{k}] {v}" for k, v in citation_map.items()]) if citation_map else ""
-                                final_answer = answer.strip() + citation_legend
+                                final_answer = answer
                                 used_contexts = contexts
-
-
-                        # Append assistant message
-                        # Apply filter before storing
-                        # Apply filter before storing
-                        final_answer = filter_response(user_input.strip(), final_answer)
 
                         # Append assistant message
                         st.session_state.messages.append({"role": "assistant", "content": final_answer})
                         st.session_state.last_answer_idx = len(st.session_state.messages) - 1
-
-
-
 
                         # Evaluate using judge model (optional)
                         metrics = evaluate_realtime(services["llm"], JUDGE_MODEL, user_input.strip(), final_answer, used_contexts) if services["llm"] else {"faithfulness": None, "answer_relevancy": None, "context_relevancy": None, "latency_sec": None, "reasons": {}}
@@ -1184,7 +1200,6 @@ with tab_chat:
         """, unsafe_allow_html=True)
 
         # File uploader with enhanced feedback and spacing
-       # File uploader with enhanced feedback and spacing
         uploaded_file = st.file_uploader(
             "Choose a PDF file", 
             type=['pdf'], 
@@ -1261,9 +1276,6 @@ with tab_chat:
                     f'<div class="status-message info-message">"{uploaded_file.name}" is already processed and ready to use!</div>',
                     unsafe_allow_html=True
                 )
-
-     
-
 
         # Add divider with spacing
         st.markdown("<br>", unsafe_allow_html=True)
