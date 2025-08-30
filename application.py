@@ -9,12 +9,14 @@ import streamlit as st
 import nltk
 import pytesseract
 from pdf2image import convert_from_path
+from PyPDF2 import PdfReader
 
 # Pinecone & hybrid search (new pinecone package)
 from pinecone import Pinecone
 from pinecone_text.sparse import BM25Encoder
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.retrievers import PineconeHybridSearchRetriever
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 # OpenAI-compatible (Groq) client
 import openai
@@ -708,7 +710,22 @@ services = initialize_services()
 def clean_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
-def extract_text_pages(pdf_path: str, pdf_name: str) -> list:
+def extract_text_pages_pypdf(pdf_path,display_name):
+    pages = []
+    try:
+        reader = PdfReader(pdf_path)
+        for i, page in enumerate(reader.pages, start=1):
+            txt = clean_text(page.extract_text() or "")
+            if txt:
+                pages.append({"page": i, "text": txt, "pdf_name": display_name})
+        return pages
+    except Exception as e:
+        st.error(f"PyPDF extraction error: {e}")
+        return []
+    
+    
+
+def extract_text_pages(pdf_path) -> list:
     """
     OCR the PDF and return a list of dicts:
     [{"page": 1, "text": "....", "pdf_name": "file.pdf"}, ...]
@@ -719,17 +736,19 @@ def extract_text_pages(pdf_path: str, pdf_name: str) -> list:
         for i, img in enumerate(images, start=1):
             txt = clean_text(pytesseract.image_to_string(img))
             if txt:
-                pages.append({"page": i, "text": txt, "pdf_name": pdf_name})
+                pages.append({"page": i, "text": txt, "pdf_name": pdf_path})
         return pages
     except Exception as e:
         st.error(f"OCR extraction error: {e}")
         return []
 
 def chunk_page_text(page_dict, chunk_size=800):
+
     """
     Create chunks from a page while preserving metadata for citation.
     Returns texts[], metadatas[] aligned lists.
     """
+
     txt = page_dict["text"]
     chunks = [txt[i:i+chunk_size] for i in range(0, len(txt), chunk_size) if txt[i:i+chunk_size].strip()]
     texts = []
@@ -738,7 +757,8 @@ def chunk_page_text(page_dict, chunk_size=800):
         texts.append(ch)
         metas.append({
             "pdf_name": page_dict.get("pdf_name"),
-            "page": page_dict.get("page"),
+            "page": page_dict.get(
+            "page"),
             "chunk_id": j
         })
     return texts, metas
@@ -760,72 +780,148 @@ def get_contexts(query: str, retriever, top_n=3):
 # -----------------------------
 # Prompt building: strict PDF-only instructions
 # -----------------------------
-# -----------------------------
-# Prompt building: strict PDF-only medical instructions
-# -----------------------------
 def build_rag_prompt(query, message_history, docs):
-    # -----------------------------
-    # 1. Build chat history
-    # -----------------------------
     history_text = ""
     if message_history:
         for msg in message_history[-5:]:
             role = "User" if msg["role"] == "user" else "Assistant"
             history_text += f"{role}: {msg['content']}\n"
 
-    # -----------------------------
-    # 2. Format context from documents
-    # -----------------------------
+    # Format context blocks with explicit citation markers
     if docs:
         ctx_blocks = []
         for i, d in enumerate(docs, start=1):
             meta = getattr(d, "metadata", {}) or {}
-            pdf = meta.get("pdf_name", "Unknown PDF")
+            pdf = meta.get("pdf_name")
             page = meta.get("page", "?")
             ctx_blocks.append(f"[C{i}] {pdf} (p.{page})\n{d.page_content}")
         context_blocks = "\n\n".join(ctx_blocks)
     else:
         context_blocks = "NO_RELEVANT_DOCUMENTS_FOUND"
 
-    # -----------------------------
-    # 3. Build the prompt
-    # -----------------------------
     prompt = f"""
-You are a professional medical assistant AI. You answer medical or drug-related queries only, strictly based on the uploaded PDF documents.
+You are a knowledgeable medical assistant tasked with answering user queries clearly and accurately. You provide preventions and diet plans when requested.
 
 ### Chat History:
 {history_text}
 
 ### Knowledge Base Context:
-{context_blocks}
+{context_blocks if context_blocks else "No relevant documents were found."}
 
-### Guidelines:
-1. Only answer questions based on the provided PDF context. Never guess or hallucinate.
-2. If context is missing, respond with: "I'm sorry, I don't have that information in the uploaded documents." 
-   - Do not include disclaimers or citations in this case.
-3. For irrelevant questions (math, trivia, coding), respond politely: 
-   "I'm a medical chatbot, here to help with medical or drug-related queries. Please ask something in that domain."
-   - Do not include disclaimers or citations.
-4. For relevant medical queries with context:
-   - Provide the answer clearly.
-   - Include only relevant sections requested by the user (e.g., dosage, usage, side effects).
-   - Always include **Disclaimer** at the bottom.
-   - Include **Citations** using the PDF name and page number, e.g., "[C1] Source PDF: file.pdf, p.12".
-5. Greet politely only if the user greets first.
-6. Use simple, layman-friendly language.
-7. Do not perform calculations or provide personalized prescriptions.
+Now, based on the above context and chat history, answer the following question:
+
+Question: {query}
+
+Guidelines:
+- If the user greets you, greet them back politely. do not add any citations for greeting. dont add any sources to the response too.
+- Always base your answers strictly on the provided context. Do not use any external knowledge or make assumptions.
+- Do not greet for every question asked. Greet only if the user greets you first.
+- Never fabricate or guess answers. If the information is not in the context, say you don't know.
+- Never start a response with "As an AI language model".
+- Never provide medical advice beyond general information. Always recommend consulting a healthcare professional for specific concerns.
+- If the user asks for a summary of the documents, provide a brief overview without citations.
+- If the context contains "NO_RELEVANT_DOCUMENTS_FOUND", respond with: "I couldn't find this information in the uploaded documents."
+- If the answer is not contained within the provided context, respond with: "I'm sorry, I don't have that information in the uploaded documents."
+- EXAMPLE FORMAT FOR GREETING:
+User: Hello
+Assistant: Hello! How can I assist you today?
+
+You are a polite and professional medical chatbot.  
+
+- Your role is to answer medical or drug-related queries and respond to simple greetings.  
+- If the user asks questions that are not related to medicine, health, or drugs (e.g., math problems, random trivia, coding), do not attempt to answer.  
+- Instead, reply politely with something like:  
+  "I'm a medical chatbot, here to help with medical or drug-related queries. Please ask me something in that domain."  
+
+Always keep your tone helpful, clear, and user-friendly.
+
+1. Standard Structure
+- Every drug/condition response should follow the same clear sections:
+- Drug Summary / Overview – short description (name, class, purpose).
+- Usage / Indications – what it's used for.
+- Dosage & Administration
+- Adult dose
+- Pediatric dose
+- Route (PO/IV/other)
+- Frequency
+- Maximum dose (if applicable)
+- Precautions / Safety Notes – contraindications, warnings, interactions (keep brief).
+- What to Do Next – simple actionable advice (e.g., consult doctor, when to seek care).
+- Disclaimer – always include a safety disclaimer.
+- Citations – structured reference to source(s).
+
+2. Tone & Language
+- Clear, concise, non-technical (layman-friendly).
+- Avoid jargon unless needed; explain medical terms briefly.
+- Neutral and professional — never give direct prescriptions, only general information.
+
+3. Safety First
+
+- Never give exact personalized medical advice (like "you should take X now").
+- Always include disclaimer: "This information is for educational purposes only and not a substitute for professional medical advice."
+- Encourage users to consult a healthcare professional.
+
+4. Consistency Rules
+
+- Always use SI units (mg, g, mL).
+- Show frequency as q4–6h, q12h etc.
+- Specify adult vs pediatric doses separately.
+- State routes (PO, IV, IM, etc.) clearly.
+
+5. Citation Guidelines
+
+- Always include at least one citation (real or placeholder).
+- Citation should the pdf name
+
+6. Response Length
+
+- Keep Summary short (2–3 lines).
+- Use bullet points for clarity.
+- Avoid long paragraphs unless needed for explanation.
+
+EXAMPLE RESPONSE FORMAT:
+Summary
+Paracetamol (Acetaminophen) is an analgesic and antipyretic used to reduce fever and mild to moderate pain.
+
+Usage / Indications
+- Fever
+- Mild to moderate pain
+
+Dosage & Administration
+- Adult: 500–1000 mg PO/IV q4–6h (max 4 g/day)
+- Pediatric: 10–15 mg/kg PO/IV q4–6h (max per guideline)
+
+Precautions / Safety
+- Avoid in severe liver disease
+- Use with caution with alcohol or hepatotoxic drugs
+
+What To Do Next
+Paracetamol may be considered as directed. Always consult a doctor before use.
+
+Disclaimer
+This information is for educational purposes only and not medical advice. Always consult a healthcare professional.
+
+Citations
+- Source: WHO Guidelines, p. 24
+
+
+### Chat history:
+{history_text}
+
+### Knowledge Base Context:
+{context_blocks}
 
 ### Question:
 {query}
 
-Answer strictly using the context above.
+Answer only using the context above.
 """
     return prompt.strip()
-
 
 # -----------------------------
 # LLM call helper
 # -----------------------------
+
 def llm_chat(client, model, prompt, temperature=0.0, max_tokens=1200):
     resp = client.chat.completions.create(
         model=model,
@@ -1113,6 +1209,7 @@ with tab_chat:
 
     # Enhanced Sidebar with proper spacing
     with col_sidebar:
+
         st.markdown("""
         <div class="sidebar-content">
             <div class="sidebar-section">
@@ -1125,109 +1222,96 @@ with tab_chat:
         """, unsafe_allow_html=True)
 
         # File uploader with enhanced feedback and spacing
-        uploaded_file = st.file_uploader(
-            "Choose a PDF file", 
-            type=['pdf'], 
-            help="Upload medical PDFs for accurate, evidence-based responses", 
-            label_visibility="collapsed"
+        uploaded_files = st.file_uploader(
+            "Choose PDF files",
+            type=["pdf"],
+            accept_multiple_files=True,
+            label_visibility="collapsed",
+            key="pdf_uploader",
         )
 
-        # Add spacing after file uploader
+        use_ocr = st.toggle(
+            "Scanned PDF (use OCR)",
+            help="Enable OCR for scanned/image-only PDFs.",
+            key="use_ocr"
+        )
+
         st.markdown("<br>", unsafe_allow_html=True)
 
-        # Process file only if it's new and not already processed
-        if uploaded_file is not None:
-            file_id = f"{uploaded_file.name}_{uploaded_file.size}"
+        if uploaded_files:  
+            all_texts, all_metas = [], []
 
-            if not st.session_state.file_processed or st.session_state.last_uploaded_file != file_id:
-                with st.spinner("Processing your PDF..."):
-                    try:
-                        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-                            tmp_file.write(uploaded_file.read())
-                            pdf_path = tmp_file.name
+            for uf in uploaded_files:
+                with st.spinner(f"Processing {uf.name}..."):
+                    # write each file to a temp path
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                        tmp.write(uf.read())
+                        pdf_path = tmp.name
 
-                        pdf_name = uploaded_file.name
-                        pages = extract_text_pages(pdf_path, pdf_name)
+    
+                    if use_ocr:
+                        pages = extract_text_pages(pdf_path)  
 
-                        if not pages:
-                            st.markdown(
-                                '<div class="status-message error-message">No text could be extracted from the PDF. Please ensure the PDF contains readable text.</div>',
-                                unsafe_allow_html=True
-                            )
-                        else:
-                            all_texts, all_metas = [], []
-                            for p in pages:
-                                texts, metas = chunk_page_text(p, chunk_size=800)
-                                all_texts.extend(texts)
-                                all_metas.extend(metas)
+                        for p in pages:
+                            p["pdf_name"] = uf.name
+                    else:
+                        pages = extract_text_pages_pypdf(pdf_path, display_name=uf.name)  
 
-                            if services['status'] == 'healthy':
-                                # fit BM25 and re-create retriever
-                                services['bm25_encoder'].fit(all_texts)
-                                services['bm25_encoder'].dump(services['bm25_path'])
+                    os.unlink(pdf_path)
 
-                                services['retriever'] = PineconeHybridSearchRetriever(
-                                    embeddings=services['embeddings'],
-                                    sparse_encoder=services['bm25_encoder'],
-                                    index=services['index']
-                                )
-
-                                # add texts + metadata
-                                services['retriever'].add_texts(texts=all_texts, metadatas=all_metas)
-
-                                st.markdown(
-                                    f'<div class="status-message success-message">Successfully processed "{uploaded_file.name}" with {len(pages)} pages and {len(all_texts)} chunks!</div>',
-                                    unsafe_allow_html=True
-                                )
-                            else:
-                                st.markdown(
-                                    '<div class="status-message error-message">Service temporarily unavailable for PDF processing. Please try again later.</div>',
-                                    unsafe_allow_html=True
-                                )
-
-                        os.unlink(pdf_path)
-
-                        # Update session state
-                        st.session_state.file_processed = True
-                        st.session_state.last_uploaded_file = file_id
-
-                    except Exception as e:
+                    if not pages:
                         st.markdown(
-                            f'<div class="status-message error-message">Error processing PDF: {str(e)}</div>',
+                            f'<div class="status-message error-message">No text could be extracted from "{uf.name}".</div>',
                             unsafe_allow_html=True
                         )
-            else:
+                        continue
+
+                    # chunk and collect
+                    for p in pages:
+                        texts, metas = chunk_page_text(p, chunk_size=800)
+                        all_texts.extend(texts)
+                        all_metas.extend(metas)
+
+            if services["status"] == "healthy" and all_texts:
+                services["bm25_encoder"].fit(all_texts)
+                services["bm25_encoder"].dump(services["bm25_path"])
+                services["retriever"] = PineconeHybridSearchRetriever(
+                    embeddings=services["embeddings"],
+                    sparse_encoder=services["bm25_encoder"],
+                    index=services["index"]
+                )
+                services["retriever"].add_texts(texts=all_texts, metadatas=all_metas)
                 st.markdown(
-                    f'<div class="status-message info-message">"{uploaded_file.name}" is already processed and ready to use!</div>',
+                    f'<div class="status-message success-message">Processed {len(uploaded_files)} file(s) into {len(all_texts)} chunks.</div>',
                     unsafe_allow_html=True
                 )
 
-        # Add divider with spacing
-        st.markdown("<br>", unsafe_allow_html=True)
-        st.markdown("---")
-        st.markdown("<br>", unsafe_allow_html=True)
-        
-        # Enhanced system status section
-        st.markdown('<div class="sidebar-section">', unsafe_allow_html=True)
-        st.markdown("### System Status")
-        if services.get('status') == 'healthy':
-            st.markdown("""
-            <div class="health-indicator">
-                <div class="health-dot health-healthy"></div>
-                <div class="health-text">All services online and ready</div>
-            </div>
-            """, unsafe_allow_html=True)
-            
-        else:
-            st.markdown(f"""
-            <div class="health-indicator">
-                <div class="health-dot health-error"></div>
-                <div class="health-text">Service issues detected</div>
-            </div>
-            """, unsafe_allow_html=True)
-            st.error(f"Service Error: {services.get('error', 'Unknown error')}")
+                # Add divider with spacing
+                st.markdown("<br>", unsafe_allow_html=True)
+                st.markdown("---")
+                st.markdown("<br>", unsafe_allow_html=True)
+                
+                # Enhanced system status section
+                st.markdown('<div class="sidebar-section">', unsafe_allow_html=True)
+                st.markdown("### System Status")
+                if services.get('status') == 'healthy':
+                    st.markdown("""
+                    <div class="health-indicator">
+                        <div class="health-dot health-healthy"></div>
+                        <div class="health-text">All services online and ready</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                else:
+                    st.markdown(f"""
+                    <div class="health-indicator">
+                        <div class="health-dot health-error"></div>
+                        <div class="health-text">Service issues detected</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    st.error(f"Service Error: {services.get('error', 'Unknown error')}")
 
-        st.markdown('</div>', unsafe_allow_html=True)
+                st.markdown('</div>', unsafe_allow_html=True)
 
         # Quick stats section with spacing
         if st.session_state.messages:
@@ -1281,11 +1365,11 @@ with tab_metrics:
         st.info("No evaluation data available yet. Start chatting to generate metrics and insights!")
         st.markdown("""
         ### What you'll see here:
-        - *Faithfulness Score*: How well responses stick to the uploaded documents
-        - *Answer Relevancy*: How well responses address user questions  
-        - *Context Relevancy*: How relevant retrieved context is to queries
-        - *Response Times*: System performance metrics
-        - *User Feedback*: Real-time satisfaction tracking
+        - Faithfulness Score: How well responses stick to the uploaded documents
+        - Answer Relevancy: How well responses address user questions  
+        - Context Relevancy: How relevant retrieved context is to queries
+        - Response Times: System performance metrics
+        - User Feedback: Real-time satisfaction tracking
         """)
         st.markdown('</div>', unsafe_allow_html=True)
     else:
